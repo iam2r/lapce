@@ -1,26 +1,30 @@
-use std::{cell::Cell, sync::Arc, time::SystemTime};
+use std::{
+    cell::{Cell, RefCell},
+    sync::Arc,
+    time::SystemTime,
+};
 
 use alacritty_terminal::{
     grid::{Dimensions, Scroll},
     index::Side,
     selection::{Selection, SelectionType},
-    term::{RenderableContent, cell::Flags, test::TermSize},
+    term::{cell::Flags, test::TermSize, RenderableContent},
 };
 use floem::{
-    Renderer, View, ViewId,
     action::{set_ime_allowed, set_ime_cursor_area},
     context::{EventCx, PaintCx},
     event::{Event, EventPropagation},
     kurbo::Stroke,
     peniko::{
-        Color,
         kurbo::{Point, Rect, Size},
+        Color,
     },
-    pointer::PointerInputEvent,
+    pointer::{PointerInputEvent, PointerMoveEvent},
     prelude::SignalTrack,
-    reactive::{ReadSignal, RwSignal, SignalGet, SignalWith, create_effect},
+    reactive::{create_effect, ReadSignal, RwSignal, SignalGet, SignalWith},
     text::{Attrs, AttrsList, FamilyOwned, TextLayout, Weight},
     views::editor::{core::register::Clipboard, text::SystemClipboard},
+    Renderer, View, ViewId,
 };
 use lapce_core::mode::Mode;
 use lapce_rpc::{proxy::ProxyRpcHandler, terminal::TermId};
@@ -32,7 +36,7 @@ use unicode_width::UnicodeWidthChar;
 use super::{panel::TerminalPanelData, raw::RawTerminal};
 use crate::{
     command::InternalCommand,
-    config::{LapceConfig, color::LapceColor},
+    config::{color::LapceColor, LapceConfig},
     debug::RunDebugProcess,
     editor::location::{EditorLocation, EditorPosition},
     listener::Listener,
@@ -76,6 +80,12 @@ pub struct TerminalView {
     current_mouse_action: MouseAction,
     preedit: Option<String>,
     ime_anchor_sent: Cell<Option<(f64, f64)>>,
+    /// Hovered http(s) URL: (url, x, y, width) in view-local px.
+    hovered_url: RefCell<Option<(String, f64, f64, f64)>>,
+    /// Font-shaped cell size; invalidated when terminal config changes.
+    char_size_cache: Cell<Option<Size>>,
+    /// Last grid cell URL-hover scanned (line, column). Skip work if unchanged.
+    last_hover_cell: Cell<Option<(i32, usize)>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -158,6 +168,9 @@ pub fn terminal_view(
         current_mouse_action: Default::default(),
         preedit: None,
         ime_anchor_sent: Cell::new(None),
+        hovered_url: RefCell::new(None),
+        char_size_cache: Cell::new(None),
+        last_hover_cell: Cell::new(None),
     }
 }
 
@@ -179,7 +192,120 @@ impl TerminalView {
         }
     }
 
+    /// 拖拽过程中的实时选区反馈
+    fn update_live_selection(&mut self, cx: &mut EventCx, mouse: &PointerMoveEvent) {
+        if let MouseAction::LeftDown { pos } = self.current_mouse_action {
+            if mouse.pos == pos {
+                return;
+            }
+            let mut selection = Selection::new(
+                SelectionType::Simple,
+                self.get_terminal_point(pos),
+                Side::Left,
+            );
+            selection.update(self.get_terminal_point(mouse.pos), Side::Right);
+            selection.include_all();
+            self.raw.write().term.selection = Some(selection);
+            cx.app_state_mut().request_paint(self.id);
+        }
+    }
+
+    /// Detect a URL under the mouse: bounded single-line scan (no grid regex).
+    /// Underline px uses the same column × char-width formula as `paint_content`.
+    /// Hover shows the underline; Ctrl+click opens the URL.
+    ///
+    /// Must not hold `self.raw` across `get_terminal_point` — parking_lot's
+    /// RwLock is not reentrant and would stall the UI thread.
+    ///
+    /// Hot path: skip while dragging, skip if the grid cell has not changed,
+    /// and reuse cached cell metrics (VS Code/xterm cache link zones and
+    /// only hit-test on move; they do not reshape fonts per mouse event).
+    fn update_url_hover(&mut self, cx: &mut EventCx, mouse: &PointerMoveEvent) {
+        if matches!(self.current_mouse_action, MouseAction::LeftDown { .. }) {
+            return;
+        }
+        if self.mode.get_untracked() != Mode::Terminal {
+            self.clear_url_hover(cx);
+            return;
+        }
+
+        let char_size = self.char_size();
+        let config = self.config.get_untracked();
+        let line_height = config.terminal_line_height() as f64;
+        let cols = (self.size.width / char_size.width).floor() as usize;
+        let cols = cols.max(1);
+        let grid_pos = self.get_terminal_point(mouse.pos);
+        let cell = (grid_pos.line.0, grid_pos.column.0);
+        if self.last_hover_cell.get() == Some(cell) {
+            return;
+        }
+        self.last_hover_cell.set(Some(cell));
+
+        let (line, display_offset) = {
+            let raw = self.raw.read();
+            let grid = raw.term.grid();
+            if grid_pos.line < grid.topmost_line()
+                || grid_pos.line > grid.bottommost_line()
+            {
+                (String::new(), grid.display_offset() as f64)
+            } else {
+                let row = &grid[grid_pos.line];
+                let mut line = String::with_capacity(cols);
+                for i in 0..cols {
+                    line.push(row[alacritty_terminal::index::Column(i)].c);
+                }
+                (line, grid.display_offset() as f64)
+            }
+        };
+
+        let mouse_col = grid_pos.column.0;
+        let mut new_hit = None;
+        let mut search_from = 0;
+        while let Some(rel) = line[search_from..].find("http") {
+            let start_byte = search_from + rel;
+            let rest = &line[start_byte..];
+            if !(rest.starts_with("http://") || rest.starts_with("https://")) {
+                search_from = start_byte + 4;
+                continue;
+            }
+            let token_end = rest
+                .find(char::is_whitespace)
+                .map(|i| start_byte + i)
+                .unwrap_or(line.len());
+            let url = line[start_byte..token_end]
+                .trim_end_matches(['.', ',', ')', ']', '!', '?', ';', ':'])
+                .to_string();
+            let start_col = line[..start_byte].chars().count();
+            let end_col = start_col + url.chars().count();
+            if mouse_col >= start_col && mouse_col < end_col && url.len() >= 8 {
+                let start_x = start_col as f64 * char_size.width;
+                let width = (end_col - start_col) as f64 * char_size.width;
+                let y = (grid_pos.line.0 as f64 + display_offset) * line_height;
+                new_hit = Some((url, start_x, y, width));
+                break;
+            }
+            search_from = token_end.max(start_byte + 1);
+        }
+
+        let changed = self.hovered_url.borrow().as_ref() != new_hit.as_ref();
+        if changed {
+            self.hovered_url.replace(new_hit);
+            cx.app_state_mut().request_paint(self.id);
+        }
+    }
+
+    fn clear_url_hover(&self, cx: &mut EventCx) {
+        self.last_hover_cell.set(None);
+        if self.hovered_url.borrow().is_some() {
+            self.hovered_url.replace(None);
+            cx.app_state_mut().request_paint(self.id);
+        }
+    }
+
     fn char_size(&self) -> Size {
+        if let Some(size) = self.char_size_cache.get() {
+            return size;
+        }
         let config = self.config.get_untracked();
         let font_family = config.terminal_font_family();
         let font_size = config.terminal_font_size();
@@ -189,7 +315,9 @@ impl TerminalView {
         let attrs_list = AttrsList::new(attrs);
         let mut text_layout = TextLayout::new();
         text_layout.set_text("W", attrs_list, None);
-        text_layout.size()
+        let size = text_layout.size();
+        self.char_size_cache.set(Some(size));
+        size
     }
 
     fn terminal_size(&self) -> (usize, usize) {
@@ -377,9 +505,9 @@ impl TerminalView {
         // While an IME preedit is active the block cursor is suppressed and
         // the composing text is drawn in its place with an underline, matching
         // native terminal behaviour.
-        let preedit_active =
-            self.is_focused && matches!(self.mode.get_untracked(), Mode::Terminal)
-                && self.preedit.is_some();
+        let preedit_active = self.is_focused
+            && matches!(self.mode.get_untracked(), Mode::Terminal)
+            && self.preedit.is_some();
 
         let mut line_content = TerminalLineContent {
             y: 0.0,
@@ -587,25 +715,36 @@ impl View for TerminalView {
 
     fn event_before_children(
         &mut self,
-        _cx: &mut EventCx,
+        cx: &mut EventCx,
         event: &Event,
     ) -> EventPropagation {
         match event {
+            Event::PointerMove(e) => {
+                self.update_live_selection(cx, e);
+                self.update_url_hover(cx, e);
+            }
+            Event::PointerLeave => {
+                self.clear_url_hover(cx);
+            }
             Event::ImePreedit { text, .. } => {
                 if self.mode.get_untracked() == Mode::Terminal {
-                    self.preedit = if text.is_empty() { None } else { Some(text.clone()) };
-                    _cx.app_state_mut().request_paint(self.id);
+                    self.preedit = if text.is_empty() {
+                        None
+                    } else {
+                        Some(text.clone())
+                    };
+                    cx.app_state_mut().request_paint(self.id);
                     return EventPropagation::Stop;
                 }
             }
             Event::ImeDisabled => {
                 if self.preedit.take().is_some() {
-                    _cx.app_state_mut().request_paint(self.id);
+                    cx.app_state_mut().request_paint(self.id);
                 }
             }
             Event::ImeCommit(text) => {
                 self.preedit = None;
-                _cx.app_state_mut().request_paint(self.id);
+                cx.app_state_mut().request_paint(self.id);
                 if self.is_focused && self.mode.get_untracked() == Mode::Terminal {
                     self.proxy.terminal_write(self.term_id, text.clone());
                     self.raw.write().term.scroll_display(Scroll::Bottom);
@@ -621,6 +760,14 @@ impl View for TerminalView {
                 match self.current_mouse_action {
                     MouseAction::LeftOnce { pos, .. } => {
                         clear_selection = true;
+                        if e.modifiers.control() {
+                            if let Some((url, ..)) =
+                                self.hovered_url.borrow().clone()
+                            {
+                                let _ = open::that(url);
+                                return EventPropagation::Stop;
+                            }
+                        }
                         if e.modifiers.control() && self.click(pos).is_some() {
                             return EventPropagation::Stop;
                         }
@@ -635,7 +782,7 @@ impl View for TerminalView {
                             .update(self.get_terminal_point(end_pos), Side::Right);
                         selection.include_all();
                         self.raw.write().term.selection = Some(selection);
-                        _cx.app_state_mut().request_paint(self.id);
+                        cx.app_state_mut().request_paint(self.id);
                     }
                     MouseAction::LeftDouble { pos } => {
                         let position = self.get_terminal_point(pos);
@@ -651,7 +798,7 @@ impl View for TerminalView {
                         selection.update(end_point, Side::Right);
                         selection.include_all();
                         raw.term.selection = Some(selection);
-                        _cx.app_state_mut().request_paint(self.id);
+                        cx.app_state_mut().request_paint(self.id);
                     }
                     MouseAction::RightOnce { pos } => {
                         let position = self.get_terminal_point(pos);
@@ -681,7 +828,7 @@ impl View for TerminalView {
                 }
                 if clear_selection {
                     self.raw.write().term.selection = None;
-                    _cx.app_state_mut().request_paint(self.id);
+                    cx.app_state_mut().request_paint(self.id);
                 }
             }
             _ => {}
@@ -696,7 +843,9 @@ impl View for TerminalView {
     ) {
         if let Ok(state) = state.downcast() {
             match *state {
-                TerminalViewState::Config => {}
+                TerminalViewState::Config => {
+                    self.char_size_cache.set(None);
+                }
                 TerminalViewState::Focus(is_focused) => {
                     self.is_focused = is_focused;
                     // Force the next paint to publish a cursor area with a
@@ -821,6 +970,20 @@ impl View for TerminalView {
         }
 
         self.paint_content(cx, content, line_height, char_size, &config);
+
+        // URL hover underline (x/y from update_url_hover, same formula as cells).
+        if mode == Mode::Terminal {
+            if let Some((_, x, y, w)) = self.hovered_url.borrow().clone() {
+                cx.fill(
+                    &Size::new(w, 1.5)
+                        .to_rect()
+                        .with_origin(Point::new(x, y + line_height - 1.5)),
+                    config.color(LapceColor::TERMINAL_FOREGROUND),
+                    0.0,
+                );
+            }
+        }
+
         // if data.find.visual {
         //     if let Some(search_string) = data.find.search_string.as_ref() {
         //         if let Ok(dfas) = RegexSearch::new(&regex::escape(search_string)) {
@@ -910,3 +1073,5 @@ enum MouseAction {
         pos: Point,
     },
 }
+
+pub const MARKER_XYZ_12345: &str = "MARKERXYZ12345";
