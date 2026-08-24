@@ -14,7 +14,8 @@ use alacritty_terminal::{event::WindowSize, event_loop::Msg};
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::Sender;
 use git2::{
-    DiffOptions, ErrorCode::NotFound, Oid, Repository, build::CheckoutBuilder,
+    DiffOptions, ErrorCode::NotFound, Oid, Repository, Status, StatusOptions,
+    StatusShow, build::CheckoutBuilder,
 };
 use grep_matcher::Matcher;
 use grep_regex::RegexMatcherBuilder;
@@ -1514,6 +1515,12 @@ fn git_delta_format(
     }
 }
 
+/// Convert a libgit2 status path (workdir-relative, often with a trailing
+/// slash for directories) into an absolute workspace path matching FileDiff.
+fn git_status_path_to_abs(workspace_path: &Path, git_path: &str) -> PathBuf {
+    workspace_path.join(git_path.trim_end_matches(['/', '\\']))
+}
+
 fn git_diff_new(workspace_path: &Path) -> Option<DiffInfo> {
     let repo = Repository::discover(workspace_path).ok()?;
     let name = match repo.head() {
@@ -1608,11 +1615,45 @@ fn git_diff_new(workspace_path: &Path) -> Option<DiffInfo> {
         | FileDiff::Renamed(p, _)
         | FileDiff::Deleted(p) => p.clone(),
     });
+    // Collect .gitignore'd paths. git2 StatusEntry::path() is workdir-relative
+    // (e.g. "node_modules/"); FileDiff and the file explorer use absolute
+    // paths, so join onto workspace_path. strip_prefix(workspace) on a relative
+    // git path always fails and previously left this list empty.
+    //
+    // Matches `git status --ignored=matching` (VS Code): workdir-only, do not
+    // recurse into ignored directories. Runs on the proxy thread after the
+    // existing 500ms fs debounce — not on the UI thread.
+    // include_untracked is required in practice so libgit2 visits workdir
+    // entries that are then classified as IGNORED.
+    let mut ignored = Vec::new();
+    let has_gitignore = workspace_path.join(".gitignore").is_file();
+    if has_gitignore {
+        let mut status_options = StatusOptions::new();
+        status_options
+            .show(StatusShow::Workdir)
+            .include_ignored(true)
+            .include_untracked(true)
+            .exclude_submodules(true)
+            .recurse_ignored_dirs(false);
+        if let Ok(statuses) = repo.statuses(Some(&mut status_options)) {
+            for entry in statuses
+                .iter()
+                .filter(|entry| entry.status().contains(Status::IGNORED))
+            {
+                if let Some(path) = entry.path() {
+                    ignored.push(git_status_path_to_abs(workspace_path, path));
+                }
+            }
+        }
+        tracing::debug!(count = ignored.len(), "collected gitignored paths");
+    }
+
     Some(DiffInfo {
         head: name,
         branches,
         tags,
         diffs: file_diffs,
+        ignored,
     })
 }
 
@@ -1758,4 +1799,30 @@ fn search_in_path(
     }
 
     Ok(ProxyResponse::GlobalSearchResponse { matches })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::git_status_path_to_abs;
+
+    #[test]
+    fn test_git_status_path_to_abs() {
+        let ws = Path::new("/tmp/workspace");
+        assert_eq!(
+            git_status_path_to_abs(ws, "node_modules/"),
+            PathBuf::from("/tmp/workspace/node_modules")
+        );
+        assert_eq!(
+            git_status_path_to_abs(ws, "packages/foo/dist"),
+            PathBuf::from("/tmp/workspace/packages/foo/dist")
+        );
+    }
+
+    #[test]
+    fn test_relative_git_path_cannot_strip_workspace() {
+        let ws = Path::new("/tmp/workspace");
+        assert!(Path::new("node_modules").strip_prefix(ws).is_err());
+    }
 }

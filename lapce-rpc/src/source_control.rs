@@ -8,6 +8,8 @@ pub struct DiffInfo {
     pub branches: Vec<String>,
     pub tags: Vec<String>,
     pub diffs: Vec<FileDiff>,
+    /// Absolute paths ignored by .gitignore (same form as [`FileDiff`] paths).
+    pub ignored: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

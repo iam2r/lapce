@@ -2105,6 +2105,12 @@ impl WindowTabData {
                         })
                         .collect();
                 });
+                self.source_control.ignored_files.update(|ignored| {
+                    ignored.clear();
+                    for path in &diff.ignored {
+                        ignored.insert(path.clone());
+                    }
+                });
 
                 let docs = self.main_split.docs.get_untracked();
                 for (_, doc) in docs {

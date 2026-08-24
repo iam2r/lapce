@@ -143,6 +143,25 @@ fn file_node_text_color(
         }
     });
 
+    // Files/directories matched by .gitignore are shown dimmed.
+    // A node is ignored if it, or any ancestor up to the workspace root,
+    // is in the ignored set (so `node_modules/` dims its children too).
+    let ignored = source_control.ignored_files.with(|ignored| {
+        let FileNodeViewKind::Path(path) = &node.kind else {
+            return false;
+        };
+        let workspace = source_control.common.workspace.path.as_deref();
+        for ancestor in path.ancestors() {
+            if ignored.contains(ancestor) {
+                return true;
+            }
+            if workspace == Some(ancestor) {
+                break;
+            }
+        }
+        false
+    });
+
     let color = match diff {
         Some(FileDiffKind::Modified | FileDiffKind::Renamed) => {
             LapceColor::SOURCE_CONTROL_MODIFIED
@@ -152,7 +171,11 @@ fn file_node_text_color(
         None => LapceColor::PANEL_FOREGROUND,
     };
 
-    config.get().color(color)
+    let mut color = config.get().color(color);
+    if ignored && diff.is_none() {
+        color = color.multiply_alpha(0.55);
+    }
+    color
 }
 
 fn file_node_text_view(

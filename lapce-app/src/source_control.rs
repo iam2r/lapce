@@ -4,7 +4,7 @@ use floem::{
     keyboard::Modifiers,
     reactive::{RwSignal, Scope, SignalWith},
 };
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use lapce_core::mode::Mode;
 use lapce_rpc::source_control::FileDiff;
 
@@ -20,6 +20,7 @@ use crate::{
 pub struct SourceControlData {
     // VCS modified files & whether they should be included in the next commit
     pub file_diffs: RwSignal<IndexMap<PathBuf, (FileDiff, bool)>>,
+    pub ignored_files: RwSignal<IndexSet<PathBuf>>,
     pub branch: RwSignal<String>,
     pub branches: RwSignal<im::Vector<String>>,
     pub tags: RwSignal<im::Vector<String>>,
@@ -64,6 +65,7 @@ impl SourceControlData {
     pub fn new(cx: Scope, editors: Editors, common: Rc<CommonData>) -> Self {
         Self {
             file_diffs: cx.create_rw_signal(IndexMap::new()),
+            ignored_files: cx.create_rw_signal(IndexSet::new()),
             branch: cx.create_rw_signal("".to_string()),
             branches: cx.create_rw_signal(im::Vector::new()),
             tags: cx.create_rw_signal(im::Vector::new()),
