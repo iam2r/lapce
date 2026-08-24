@@ -206,6 +206,7 @@ impl AppData {
         WindowConfig::default()
             .apply_default_theme(false)
             .title("Lapce")
+            .app_id("dev.lapce.lapce")
     }
 
     pub fn new_window(&self, folder: Option<PathBuf>) {
@@ -3753,7 +3754,12 @@ pub fn launch() {
 
     // small hack to unblock terminal if launched from it
     // launch it as a separate process that waits
-    if !cli.wait {
+    // (iam2r local patch): only do this when stdin IS a terminal — the hack
+    // exists to unblock interactive terminals. When launched from a desktop
+    // environment (app grid), re-exec makes the parent exit immediately,
+    // which breaks GNOME's systemd-scope launch tracking and delays the
+    // dock/taskbar entry by its ~15s timeout.
+    if !cli.wait && std::io::stdin().is_terminal() {
         let mut args = std::env::args().collect::<Vec<_>>();
         args.push("--wait".to_string());
         let mut cmd = std::process::Command::new(&args[0]);
