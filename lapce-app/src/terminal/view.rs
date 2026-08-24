@@ -1,13 +1,14 @@
-use std::{sync::Arc, time::SystemTime};
+use std::{cell::Cell, sync::Arc, time::SystemTime};
 
 use alacritty_terminal::{
-    grid::Dimensions,
+    grid::{Dimensions, Scroll},
     index::Side,
     selection::{Selection, SelectionType},
     term::{RenderableContent, cell::Flags, test::TermSize},
 };
 use floem::{
     Renderer, View, ViewId,
+    action::{set_ime_allowed, set_ime_cursor_area},
     context::{EventCx, PaintCx},
     event::{Event, EventPropagation},
     kurbo::Stroke,
@@ -73,6 +74,8 @@ pub struct TerminalView {
     hyper_regs: Vec<Regex>,
     previous_mouse_action: MouseAction,
     current_mouse_action: MouseAction,
+    preedit: Option<String>,
+    ime_anchor_sent: Cell<Option<(f64, f64)>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -119,6 +122,15 @@ pub fn terminal_view(
         }
 
         if last != Some(is_focused) {
+            if is_focused {
+                // Enable IME while the terminal is focused so input methods
+                // (e.g. Chinese/Japanese/Korean) work in the terminal.
+                // Cursor-area is set after layout from paint, using the same
+                // cell metrics as rendering. Setting it here with a guessed
+                // width (fullwidth "中", min 40px) put the candidate window
+                // on the wrong cell until the cursor moved.
+                set_ime_allowed(true);
+            }
             id.update_state(TerminalViewState::Focus(is_focused));
         }
 
@@ -144,10 +156,29 @@ pub fn terminal_view(
         hyper_regs: vec![reg],
         previous_mouse_action: Default::default(),
         current_mouse_action: Default::default(),
+        preedit: None,
+        ime_anchor_sent: Cell::new(None),
     }
 }
 
 impl TerminalView {
+    /// Update the IME candidate window. `x`/`y` are view-local; the compositor
+    /// needs window coordinates (`layout_rect` origin + local).
+    ///
+    /// Cache the *window* position, not the local one: on first focus
+    /// `layout_rect` can still be stale. Caching local (x, y) would skip the
+    /// later paint that has a valid origin, until the cursor (local x) moves —
+    /// which is why the first composition was misplaced and later ones were not.
+    fn dispatch_ime_anchor_if_moved(&self, x: f64, y: f64, size: Size) {
+        let rect = self.id.layout_rect();
+        let wx = rect.x0 + x;
+        let wy = rect.y0 + y;
+        if self.ime_anchor_sent.get() != Some((wx, wy)) {
+            self.ime_anchor_sent.set(Some((wx, wy)));
+            set_ime_cursor_area(Point::new(wx, wy), size);
+        }
+    }
+
     fn char_size(&self) -> Size {
         let config = self.config.get_untracked();
         let font_family = config.terminal_font_family();
@@ -343,6 +374,13 @@ impl TerminalView {
 
         let cursor_point = &content.cursor.point;
 
+        // While an IME preedit is active the block cursor is suppressed and
+        // the composing text is drawn in its place with an underline, matching
+        // native terminal behaviour.
+        let preedit_active =
+            self.is_focused && matches!(self.mode.get_untracked(), Mode::Terminal)
+                && self.preedit.is_some();
+
         let mut line_content = TerminalLineContent {
             y: 0.0,
             bg: Vec::new(),
@@ -401,14 +439,14 @@ impl TerminalView {
                 }
             }
 
-            if cursor_point == &point {
+            if cursor_point == &point && !preedit_active {
                 line_content.cursor = Some((cell.c, x));
             }
 
             let bold = cell.flags.contains(Flags::BOLD)
                 || cell.flags.contains(Flags::DIM_BOLD);
 
-            if &point == cursor_point && self.is_focused {
+            if &point == cursor_point && self.is_focused && !preedit_active {
                 fg = term_bg;
             }
 
@@ -421,6 +459,57 @@ impl TerminalView {
             }
         }
         self.paint_line_content(cx, &line_content, line_height, char_width, config);
+
+        // Draw the IME preedit inline at the cursor position: same foreground
+        // as regular text over the terminal background, with an underline.
+        // The block cursor is hidden while composing and restored on commit.
+        let mut ime_area = Size::new(char_width, line_height);
+        if preedit_active {
+            if let Some(preedit) = &self.preedit {
+                let x = cursor_point.column.0 as f64 * char_width;
+                let y = (cursor_point.line.0 as f64 + content.display_offset as f64)
+                    * line_height;
+                let char_y = y + (line_height - char_size.height) / 2.0;
+                let fg = config.color(LapceColor::TERMINAL_FOREGROUND);
+
+                let mut text_layout = TextLayout::new();
+                text_layout.set_text(
+                    preedit,
+                    AttrsList::new(attrs.clone().color(fg)),
+                    None,
+                );
+                let width = text_layout.size().width.max(char_width);
+                ime_area = Size::new(width, line_height);
+
+                cx.fill(
+                    &Size::new(width, line_height)
+                        .to_rect()
+                        .with_origin(Point::new(x, y)),
+                    term_bg,
+                    0.0,
+                );
+                cx.draw_text(&text_layout, Point::new(x, char_y));
+
+                cx.fill(
+                    &Size::new(width, 1.5)
+                        .to_rect()
+                        .with_origin(Point::new(x, y + line_height - 1.5)),
+                    fg,
+                    0.0,
+                );
+            }
+        }
+
+        // Keep the IME candidate window anchored to the terminal cursor while
+        // this view is focused; position converges after every layout pass.
+        // Area size matches the caret, or the preedit underline while composing
+        // (language-agnostic: measured text, not a sample CJK glyph).
+        if self.is_focused && matches!(self.mode.get_untracked(), Mode::Terminal) {
+            let ix = cursor_point.column.0 as f64 * char_width;
+            let iy = (cursor_point.line.0 as f64 + content.display_offset as f64)
+                * line_height;
+            self.dispatch_ime_anchor_if_moved(ix, iy, ime_area);
+        }
     }
 
     fn paint_line_content(
@@ -502,6 +591,27 @@ impl View for TerminalView {
         event: &Event,
     ) -> EventPropagation {
         match event {
+            Event::ImePreedit { text, .. } => {
+                if self.mode.get_untracked() == Mode::Terminal {
+                    self.preedit = if text.is_empty() { None } else { Some(text.clone()) };
+                    _cx.app_state_mut().request_paint(self.id);
+                    return EventPropagation::Stop;
+                }
+            }
+            Event::ImeDisabled => {
+                if self.preedit.take().is_some() {
+                    _cx.app_state_mut().request_paint(self.id);
+                }
+            }
+            Event::ImeCommit(text) => {
+                self.preedit = None;
+                _cx.app_state_mut().request_paint(self.id);
+                if self.is_focused && self.mode.get_untracked() == Mode::Terminal {
+                    self.proxy.terminal_write(self.term_id, text.clone());
+                    self.raw.write().term.scroll_display(Scroll::Bottom);
+                    return EventPropagation::Stop;
+                }
+            }
             Event::PointerDown(e) => {
                 self.update_mouse_action_by_down(e);
             }
@@ -589,6 +699,9 @@ impl View for TerminalView {
                 TerminalViewState::Config => {}
                 TerminalViewState::Focus(is_focused) => {
                     self.is_focused = is_focused;
+                    // Force the next paint to publish a cursor area with a
+                    // post-layout window origin.
+                    self.ime_anchor_sent.set(None);
                 }
                 TerminalViewState::Raw(raw) => {
                     self.raw = raw;
