@@ -243,12 +243,26 @@ pub fn editor_view(
                     set_ime_allowed(true);
                 }
                 let (offset, affinity) = cursor.with(|c| (c.offset(), c.affinity));
-                let (_, point_below) = ed1.points_of_offset(offset, affinity);
+                let (point_above, point_below) =
+                    ed1.points_of_offset(offset, affinity);
                 let window_origin = editor_window_origin.get();
                 let viewport = editor_viewport.get();
                 let pos = window_origin
-                    + (point_below.x - viewport.x0, point_below.y - viewport.y0);
-                set_ime_cursor_area(pos, Size::new(800.0, 600.0));
+                    + (point_above.x - viewport.x0, point_above.y - viewport.y0);
+                let line_h = (point_below.y - point_above.y).abs().max(1.0);
+                let em = config.get_untracked().editor.font_size() as f64;
+                let preedit_chars = ed1.doc().preedit().preedit.with(|preedit| {
+                    preedit
+                        .as_ref()
+                        .map(|p| p.text.chars().count())
+                        .unwrap_or(0)
+                });
+                let width = if preedit_chars == 0 {
+                    em
+                } else {
+                    em * preedit_chars as f64
+                };
+                set_ime_cursor_area(pos, Size::new(width.max(1.0), line_h));
             }
         }
     });

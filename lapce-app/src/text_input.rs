@@ -200,10 +200,12 @@ fn text_input_full<T: KeyPressFocus + 'static>(
                 let viewport = editor.viewport.get();
                 let origin = window_origin
                     + Vec2::new(
-                        cursor_line.p1.x - viewport.x0,
-                        cursor_line.p1.y - viewport.y0,
+                        cursor_line.p0.x - viewport.x0,
+                        cursor_line.p0.y - viewport.y0,
                     );
-                set_ime_cursor_area(origin, Size::new(800.0, 600.0));
+                let caret_h = (cursor_line.p1.y - cursor_line.p0.y).abs().max(1.0);
+                let em = config.get_untracked().editor.font_size() as f64;
+                set_ime_cursor_area(origin, Size::new(em.max(1.0), caret_h));
             }
         });
     }
