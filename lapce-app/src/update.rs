@@ -19,8 +19,15 @@ pub struct ReleaseAsset {
     pub browser_download_url: String,
 }
 
+#[allow(unreachable_code)]
 pub fn get_latest_release() -> Result<ReleaseInfo> {
-    let url = match meta::RELEASE {
+    // Local build (iam2r): disable self-update.
+    // Clicking the in-app update replaces this patched binary with an
+    // official one that lacks the app_id fix (lapce#2199).
+    return Err(anyhow!("self-update is disabled in this local build"));
+
+    {
+        let url = match meta::RELEASE {
         meta::ReleaseType::Debug => {
             return Err(anyhow!("no release for debug"));
         }
@@ -50,6 +57,7 @@ pub fn get_latest_release() -> Result<ReleaseInfo> {
     };
 
     Ok(release)
+    }
 }
 
 pub fn download_release(release: &ReleaseInfo) -> Result<PathBuf> {

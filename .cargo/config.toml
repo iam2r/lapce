@@ -1,3 +1,8 @@
 # Link runtime statically so Visual C++ Redist is not required
 [target.'cfg(all(windows, target_env = "msvc"))']
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# 本地构建身份: Stable 通道(数据目录 lapce-stable, 与官方发布一致)
+# 升级到新 tag 时同步更新此值
+[env]
+RELEASE_TAG_NAME = "v0.4.6"

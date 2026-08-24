@@ -10,3 +10,7 @@ vendor/
 
 .DS_Store
 *.patch
+
+# local-build artifacts (not for upstream)
+*.deb
+*.log
